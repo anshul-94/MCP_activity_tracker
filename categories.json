@@ -1,0 +1,77 @@
+{
+  "productivity": [
+    "coding",
+    "project_work",
+    "meeting",
+    "client_call",
+    "office_work",
+    "task_management",
+    "research",
+    "other"
+  ],
+  "study": [
+    "studying",
+    "reading",
+    "course_learning",
+    "revision",
+    "practice",
+    "notes_making",
+    "other"
+  ],
+  "fitness": [
+    "gym",
+    "workout",
+    "running",
+    "yoga",
+    "sports",
+    "walking",
+    "other"
+  ],
+  "entertainment": [
+    "movies",
+    "web_series",
+    "youtube",
+    "gaming",
+    "music",
+    "scrolling",
+    "other"
+  ],
+  "social": [
+    "friends",
+    "family_time",
+    "party",
+    "hangout",
+    "call",
+    "events",
+    "other"
+  ],
+  "personal_care": [
+    "sleep",
+    "self_care",
+    "meditation",
+    "routine",
+    "grooming",
+    "other"
+  ],
+  "travel": [
+    "commute",
+    "trip",
+    "driving",
+    "ride",
+    "outing",
+    "other"
+  ],
+  "health": [
+    "doctor_visit",
+    "medicine",
+    "checkup",
+    "therapy",
+    "rest",
+    "other"
+  ],
+  "misc": [
+    "random",
+    "unplanned",
+    "other"
+  ]
+}
