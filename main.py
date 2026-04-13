@@ -97,51 +97,161 @@ def log_activity(activity: str, start_time: str, end_time: str, date: str):
         logger.error(f"LOG ERROR: {e}")
         return f"❌ Failed to log activity: {str(e)}"
 
-# TOOL 2: SEARCH ACTIVITY
 @mcp.tool()
-def search_activity(start_time: str, end_time: str, date: str):
+def search_activity(
+    start_time: str = None,
+    end_time: str = None,
+    date: str = None,
+    keyword: str = None,
+    category: str = None
+):
     try:
         with get_db_connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            cursor.execute("""
-            SELECT category, sub_activity, start_time, end_time
-            FROM activities
-            WHERE date = ?
-            AND start_time <= ?
-            AND end_time >= ?
-            """, (date, end_time, start_time))
+            query = "SELECT * FROM activities WHERE 1=1"
+            params = []
 
+            if date:
+                query += " AND date = ?"
+                params.append(date)
+
+            if start_time and end_time:
+                query += " AND start_time <= ? AND end_time >= ?"
+                params.extend([end_time, start_time])
+
+            if keyword:
+                query += " AND sub_activity LIKE ?"
+                params.append(f"%{keyword}%")
+
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+
+            cursor.execute(query, params)
             rows = cursor.fetchall()
 
         if not rows:
             return "No activity found"
 
         return [
-            f"{r['category']} ({r['sub_activity']}) {r['start_time']}–{r['end_time']}"
+            f"{r['date']} | {r['category']} ({r['sub_activity']}) {r['start_time']}–{r['end_time']}"
             for r in rows
         ]
 
     except Exception as e:
         logger.error(f"SEARCH ERROR: {e}")
         return f"❌ Search failed: {str(e)}"
+    
 
-# TOOL 3: SUMMARY
+
 @mcp.tool()
-def activity_summary(date: str):
+def delete_activity(
+    date: str = None,
+    start_time: str = None,
+    end_time: str = None,
+    keyword: str = None
+):
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            query = "DELETE FROM activities WHERE 1=1"
+            params = []
+
+            if date:
+                query += " AND date = ?"
+                params.append(date)
+
+            if start_time and end_time:
+                query += " AND start_time <= ? AND end_time >= ?"
+                params.extend([end_time, start_time])
+
+            if keyword:
+                query += " AND sub_activity LIKE ?"
+                params.append(f"%{keyword}%")
+
+            cursor.execute(query, params)
+            deleted = cursor.rowcount
+
+        return f"✅ Deleted {deleted} activities"
+
+    except Exception as e:
+        logger.error(f"DELETE ERROR: {e}")
+        return f"❌ Delete failed: {str(e)}"
+    
+
+@mcp.tool()
+def update_activity(
+    date: str,
+    old_start_time: str,
+    old_end_time: str,
+    new_start_time: str = None,
+    new_end_time: str = None,
+    new_category: str = None,
+    new_sub_activity: str = None
+):
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+
+            updates = []
+            params = []
+
+            if new_start_time:
+                updates.append("start_time = ?")
+                params.append(new_start_time)
+
+            if new_end_time:
+                updates.append("end_time = ?")
+                params.append(new_end_time)
+
+            if new_category:
+                updates.append("category = ?")
+                params.append(new_category)
+
+            if new_sub_activity:
+                updates.append("sub_activity = ?")
+                params.append(new_sub_activity)
+
+            if not updates:
+                return "⚠️ Nothing to update"
+
+            query = f"""
+            UPDATE activities
+            SET {', '.join(updates)}
+            WHERE date = ? AND start_time = ? AND end_time = ?
+            """
+
+            params.extend([date, old_start_time, old_end_time])
+
+            cursor.execute(query, params)
+            updated = cursor.rowcount
+
+        return f"✅ Updated {updated} activities"
+
+    except Exception as e:
+        logger.error(f"UPDATE ERROR: {e}")
+        return f"❌ Update failed: {str(e)}"
+    
+@mcp.tool()
+def activity_summary(date: str = None):
     try:
         with get_db_connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            cursor.execute("""
-            SELECT category, COUNT(*) as count
-            FROM activities
-            WHERE date = ?
-            GROUP BY category
-            """, (date,))
+            query = "SELECT category, COUNT(*) as count FROM activities WHERE 1=1"
+            params = []
 
+            if date:
+                query += " AND date = ?"
+                params.append(date)
+
+            query += " GROUP BY category"
+
+            cursor.execute(query, params)
             rows = cursor.fetchall()
 
         if not rows:
@@ -152,6 +262,7 @@ def activity_summary(date: str):
     except Exception as e:
         logger.error(f"SUMMARY ERROR: {e}")
         return f"❌ Summary failed: {str(e)}"
+
 
 # RUN SERVER
 if __name__ == "__main__":mcp.run(transport="http",host="0.0.0.0",port=8000)
