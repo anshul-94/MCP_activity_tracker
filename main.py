@@ -45,14 +45,55 @@ def load_categories():
         return json.load(f)
 
 def find_category(activity_text):
-    categories = load_categories()
+    import re
     text = activity_text.lower()
     
-    for category_name, keywords in categories.items():
-        for word in keywords:
-            if word in text:
-                return category_name, word
-    return "misc", "other"
+    # Strict mapping from user rules
+    mapping = {
+        "Productivity": ["coding", "project", "meeting", "work", "office", "client", "research"],
+        "Study": ["study", "learning", "reading", "course", "notes", "practice"],
+        "Fitness": ["gym", "workout", "running", "yoga", "training", "sports"],
+        "Entertainment": ["movie", "youtube", "music", "gaming", "series", "video", "scrolling"],
+        "Social": ["friends", "family", "party", "hangout", "social", "outing"],
+        "Travel": ["walking", "travel", "commute", "driving", "trip", "ride"]
+    }
+    
+    # Check for exact word matches first to avoid partial matches like "work" in "workout"
+    for cat, keywords in mapping.items():
+        for kw in keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', text):
+                return cat
+            
+    # Fallback to partial matches if no exact word matches
+    for cat, keywords in mapping.items():
+        if any(kw in text for kw in keywords):
+            return cat
+            
+    # Intelligent inference fallback
+    if any(k in text for k in ["code", "dev", "fix", "task"]): return "Productivity"
+    if any(k in text for k in ["learn", "book", "read"]): return "Study"
+    if any(k in text for k in ["exercise", "sport", "gym"]): return "Fitness"
+    if any(k in text for k in ["watch", "listen", "play"]): return "Entertainment"
+    if any(k in text for k in ["meet", "talk", "chat", "call"]): return "Social"
+    if any(k in text for k in ["move", "drive", "fly", "bus", "train"]): return "Travel"
+    
+    return "Productivity" # Default to Productivity instead of Misc as per "Infer intelligently"
+
+def format_time_12h(time_24h):
+    """13:00 -> 1 PM"""
+    try:
+        dt = datetime.strptime(time_24h, "%H:%M")
+        return dt.strftime("%-I %p").replace(" 0", " ")
+    except:
+        return time_24h
+
+def format_date_short(date_str):
+    """2024-04-10 -> Apr 10"""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return dt.strftime("%b %d")
+    except:
+        return date_str
 
 def validate_time(time_str):
     # Enforce HH:MM format
@@ -88,13 +129,13 @@ def log_activity(description: str, start_time: str, end_time: str, date: str = N
     if not validate_date(date):
         return "❌ Error: Use YYYY-MM-DD format for date (e.g. 2024-12-31)"
 
-    category, sub = find_category(description)
+    category = find_category(description)
 
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO activities (description, category, sub_activity, start_time, end_time, date) VALUES (?, ?, ?, ?, ?, ?)",
-        (description, category, sub, start_time, end_time, date)
+        "INSERT INTO activities (description, category, start_time, end_time, date) VALUES (?, ?, ?, ?, ?)",
+        (description, category, start_time, end_time, date)
     )
     conn.commit()
     conn.close()
@@ -105,7 +146,11 @@ def log_activity(description: str, start_time: str, end_time: str, date: str = N
 def list_activities(date: str = None, keyword: str = None):
     """
     List activities. You can filter by date or search by keyword.
+    If no date is provided, it shows today's activities.
     """
+    if not date and not keyword:
+        date = datetime.now().strftime("%Y-%m-%d")
+
     conn = get_db()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -117,8 +162,7 @@ def list_activities(date: str = None, keyword: str = None):
         query += " AND date = ?"
         params.append(date)
     if keyword:
-        query += " AND (description LIKE ? OR sub_activity LIKE ?)"
-        params.append(f"%{keyword}%")
+        query += " AND (description LIKE ?)"
         params.append(f"%{keyword}%")
 
     query += " ORDER BY date DESC, start_time DESC"
@@ -127,12 +171,18 @@ def list_activities(date: str = None, keyword: str = None):
     conn.close()
 
     if not rows:
-        return "No activities found."
+        return f"No activities found for {'today' if not date else date}."
 
-    output = "Activities found:\n"
+    # Format strictly: Date | Time | Activity | Category
+    lines = []
     for r in rows:
-        output += f"ID: {r['id']} | {r['date']} | {r['start_time']}-{r['end_time']} | {r['description']} [{r['category']}]\n"
-    return output
+        d = format_date_short(r['date'])
+        t1 = format_time_12h(r['start_time'])
+        t2 = format_time_12h(r['end_time'])
+        time_range = f"{t1}–{t2}"
+        lines.append(f"{d} | {time_range} | {r['description']} | {r['category']}")
+    
+    return "\n".join(lines)
 
 @mcp.tool()
 def delete_activity(activity_id: int):
@@ -166,12 +216,13 @@ def get_summary(date: str = None):
     conn.close()
 
     if not rows:
-        return "No data for summary."
+        return f"No data available for summary ({'all time' if not date else date})."
 
-    summary = "Category Summary:\n"
+    summary = f"📊 Activity Summary ({'All Time' if not date else format_date_short(date)}):\n"
     for category, count in rows:
-        summary += f"- {category}: {count}\n"
+        summary += f"• {category}: {count} activities\n"
     return summary
+
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
