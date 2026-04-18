@@ -1,7 +1,9 @@
 import os
 import sqlite3
 import json
+import re
 from datetime import datetime
+from contextlib import contextmanager
 from fastmcp import FastMCP
 
 # Initialize MCP Server
@@ -16,62 +18,68 @@ print(f"🚀 MCP Activity Tracker starting...")
 print(f"📁 Database Path: {DB_PATH}")
 
 # 2. DATABASE HELPERS
+@contextmanager
 def get_db():
+    """Context manager for SQLite database connections."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent write handling
-    return conn
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def init_db():
     """
     Ensures the table exists with user_id and UNIQUE constraint.
-    Safe to run on every startup — uses CREATE TABLE IF NOT EXISTS.
     """
-    conn = get_db()
-    cursor = conn.cursor()
+    with get_db() as conn:
+        cursor = conn.cursor()
 
-    # Check if user_id column exists (handles old DBs gracefully)
-    cursor.execute("PRAGMA table_info(activities)")
-    cols = [row[1] for row in cursor.fetchall()]
+        # Check if user_id column exists (handles old DBs gracefully)
+        cursor.execute("PRAGMA table_info(activities)")
+        cols = [row[1] for row in cursor.fetchall()]
 
-    if not cols:
-        # Fresh database — create with full schema
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS activities (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                description TEXT NOT NULL,
-                category    TEXT,
-                sub_activity TEXT,
-                start_time  TEXT,
-                end_time    TEXT,
-                date        TEXT,
-                user_id     TEXT NOT NULL DEFAULT 'default_user',
-                UNIQUE(description, date, start_time, end_time, user_id)
-            )
-        """)
-    elif "user_id" not in cols:
-        # Old schema — add user_id column safely
-        cursor.execute("ALTER TABLE activities ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default_user'")
-        print("⚠️  Migrated: added user_id column to existing table.")
+        if not cols:
+            # Fresh database — create with full schema
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS activities (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    description TEXT NOT NULL,
+                    category    TEXT,
+                    sub_activity TEXT,
+                    start_time  TEXT,
+                    end_time    TEXT,
+                    date        TEXT,
+                    user_id     TEXT NOT NULL DEFAULT 'default_user',
+                    UNIQUE(description, date, start_time, end_time, user_id)
+                )
+            """)
+        elif "user_id" not in cols:
+            # Old schema — add user_id column safely
+            cursor.execute("ALTER TABLE activities ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default_user'")
+            print("⚠️  Migrated: added user_id column to existing table.")
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 init_db()
 
 # 3. UTILITY FUNCTIONS
 def load_categories():
     """Load categories from JSON config file."""
-    if not os.path.exists(CATEGORY_FILE):
+    try:
+        if not os.path.exists(CATEGORY_FILE):
+            return {}
+        with open(CATEGORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
         return {}
-    with open(CATEGORY_FILE, "r") as f:
-        return json.load(f)
 
 def find_category(activity_text: str) -> str:
     """
     Categorize an activity description using categories.json.
     Supports partial matches and prioritization.
     """
-    import re
     text = activity_text.lower()
     
     # Priority Overrides (to handle collisions like "football with friends")
@@ -161,35 +169,36 @@ def log_activity(
     - start_time & end_time: HH:MM format (e.g. 14:30)
     - date: YYYY-MM-DD (defaults to today if omitted)
     - user_id: identifies the user. Defaults to 'default_user'.
-    Duplicate entries (same description + date + times + user) are silently ignored.
     """
-    if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
-
-    start_time = normalize_time(start_time)
-    end_time = normalize_time(end_time)
-    if not start_time or not end_time:
-        return "❌ Error: Invalid time format. Examples: '14:30', '4 PM', '4:30 pm'"
-    if not validate_date(date):
-        return "❌ Error: Use YYYY-MM-DD format for date (e.g. 2026-04-18)"
-
-    category = find_category(description)
-
-    conn = get_db()
-    cursor = conn.cursor()
     try:
-        cursor.execute(
-            """INSERT OR IGNORE INTO activities
-               (description, category, start_time, end_time, date, user_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (description, category, start_time, end_time, date, user_id)
-        )
-        conn.commit()
-        if cursor.rowcount == 0:
-            return f"⚠️ Duplicate skipped: '{description}' already logged for {user_id} on {date} at {start_time}–{end_time}"
-        return f"✅ Logged '{description}' under {category} for user '{user_id}'"
-    finally:
-        conn.close()
+        user_id = user_id or "default_user"
+        if not date:
+            date = datetime.now().strftime("%Y-%m-%d")
+
+        s_time = normalize_time(start_time)
+        e_time = normalize_time(end_time)
+        
+        if not s_time or not e_time:
+            return f"❌ Error: Invalid time format '{start_time}' or '{end_time}'. Examples: '14:30', '4 PM'"
+        if not validate_date(date):
+            return f"❌ Error: Invalid date '{date}'. Use YYYY-MM-DD format."
+
+        category = find_category(description)
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT OR IGNORE INTO activities
+                   (description, category, start_time, end_time, date, user_id)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (description, category, s_time, e_time, date, user_id)
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                return f"⚠️ Duplicate skipped: '{description}' already logged for {user_id} on {date} at {s_time}–{e_time}"
+            return f"✅ Logged '{description}' under {category} for user '{user_id}'"
+    except Exception as e:
+        return f"❌ System Error in log_activity: {str(e)}"
 
 
 @mcp.tool()
@@ -202,44 +211,43 @@ def list_activities(
     """
     List activities for a specific user.
     - date: filter by YYYY-MM-DD. Defaults to today if no other filter set.
-    - keyword: search activity descriptions.
-    - all_time: set True to retrieve all historical records for this user.
     - user_id: only returns data for this user. Defaults to 'default_user'.
     """
-    if not date and not keyword and not all_time:
-        date = datetime.now().strftime("%Y-%m-%d")
+    try:
+        user_id = user_id or "default_user"
+        if not date and not keyword and not all_time:
+            date = datetime.now().strftime("%Y-%m-%d")
 
-    conn = get_db()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM activities WHERE user_id = ?"
+            params = [user_id]
 
-    query = "SELECT * FROM activities WHERE user_id = ?"
-    params = [user_id]
+            if not all_time and date:
+                query += " AND date = ?"
+                params.append(date)
+            if keyword:
+                query += " AND description LIKE ?"
+                params.append(f"%{keyword}%")
 
-    if not all_time and date:
-        query += " AND date = ?"
-        params.append(date)
-    if keyword:
-        query += " AND description LIKE ?"
-        params.append(f"%{keyword}%")
+            query += " ORDER BY date DESC, start_time ASC LIMIT 50"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
-    query += " ORDER BY date DESC, start_time ASC LIMIT 50"
-    cursor.execute(query, params)
-    rows = cursor.fetchall()
-    conn.close()
+            if not rows:
+                scope = f"today ({date})" if date and not all_time else "all time"
+                return f"No activities found for user '{user_id}' [{scope}]."
 
-    if not rows:
-        scope = f"today ({date})" if date and not all_time else "all time"
-        return f"No activities found for user '{user_id}' [{scope}]."
+            lines = []
+            for r in rows:
+                d = format_date_short(r["date"])
+                t1 = format_time_12h(r["start_time"])
+                t2 = format_time_12h(r["end_time"])
+                lines.append(f"#{r['id']} | {d} | {t1}–{t2} | {r['description']} | {r['category']}")
 
-    lines = []
-    for r in rows:
-        d = format_date_short(r["date"])
-        t1 = format_time_12h(r["start_time"])
-        t2 = format_time_12h(r["end_time"])
-        lines.append(f"#{r['id']} | {d} | {t1}–{t2} | {r['description']} | {r['category']}")
-
-    return "\n".join(lines)
+            return "\n".join(lines)
+    except Exception as e:
+        return f"❌ System Error in list_activities: {str(e)}"
 
 
 @mcp.tool()
@@ -251,42 +259,43 @@ def search_activity(
 ) -> str:
     """
     Search activities for a specific user by keyword, category, and/or date.
-    If no date is set, searches ALL historical records for this user.
     - user_id: only returns this user's data. Defaults to 'default_user'.
     """
-    conn = get_db()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    try:
+        user_id = user_id or "default_user"
+        with get_db() as conn:
+            cursor = conn.cursor()
 
-    sql = "SELECT * FROM activities WHERE user_id = ?"
-    params = [user_id]
+            sql = "SELECT * FROM activities WHERE user_id = ?"
+            params = [user_id]
 
-    if date:
-        sql += " AND date = ?"
-        params.append(date)
-    if query:
-        sql += " AND description LIKE ?"
-        params.append(f"%{query}%")
-    if category:
-        sql += " AND LOWER(category) = LOWER(?)"
-        params.append(category)
+            if date:
+                sql += " AND date = ?"
+                params.append(date)
+            if query:
+                sql += " AND description LIKE ?"
+                params.append(f"%{query}%")
+            if category:
+                sql += " AND LOWER(category) = LOWER(?)"
+                params.append(category)
 
-    sql += " ORDER BY date DESC, start_time ASC LIMIT 50"
-    cursor.execute(sql, params)
-    rows = cursor.fetchall()
-    conn.close()
+            sql += " ORDER BY date DESC, start_time ASC LIMIT 50"
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
 
-    if not rows:
-        return f"No activities found for user '{user_id}'."
+            if not rows:
+                return f"No activities found for user '{user_id}' with the given filters."
 
-    lines = []
-    for r in rows:
-        d = format_date_short(r["date"])
-        t1 = format_time_12h(r["start_time"])
-        t2 = format_time_12h(r["end_time"])
-        lines.append(f"#{r['id']} | {d} | {t1}–{t2} | {r['description']} | {r['category']}")
+            lines = []
+            for r in rows:
+                d = format_date_short(r["date"])
+                t1 = format_time_12h(r["start_time"])
+                t2 = format_time_12h(r["end_time"])
+                lines.append(f"#{r['id']} | {d} | {t1}–{t2} | {r['description']} | {r['category']}")
 
-    return "\n".join(lines)
+            return "\n".join(lines)
+    except Exception as e:
+        return f"❌ System Error in search_activity: {str(e)}"
 
 
 @mcp.tool()
@@ -300,52 +309,54 @@ def update_activity(
 ) -> str:
     """
     Update fields of an existing activity. Only this user's records can be modified.
-    Provide only the fields you want to change.
     - user_id: only updates records owned by this user. Defaults to 'default_user'.
     """
-    updates = []
-    params = []
+    try:
+        user_id = user_id or "default_user"
+        updates = []
+        params = []
 
-    if description:
-        updates.append("description = ?")
-        params.append(description)
-        updates.append("category = ?")
-        params.append(find_category(description))
-    if start_time:
-        start_time = normalize_time(start_time)
-        if not start_time:
-            return "❌ Invalid start_time format. Examples: '14:30', '4 PM', '4:30 pm'"
-        updates.append("start_time = ?")
-        params.append(start_time)
-    if end_time:
-        end_time = normalize_time(end_time)
-        if not end_time:
-            return "❌ Invalid end_time format. Examples: '14:30', '4 PM', '4:30 pm'"
-        updates.append("end_time = ?")
-        params.append(end_time)
-    if date:
-        if not validate_date(date):
-            return "❌ Invalid date format. Use YYYY-MM-DD (e.g. 2026-04-18)"
-        updates.append("date = ?")
-        params.append(date)
+        if description:
+            updates.append("description = ?")
+            params.append(description)
+            updates.append("category = ?")
+            params.append(find_category(description))
+        if start_time:
+            s_time = normalize_time(start_time)
+            if not s_time:
+                return f"❌ Invalid start_time format '{start_time}'."
+            updates.append("start_time = ?")
+            params.append(s_time)
+        if end_time:
+            e_time = normalize_time(end_time)
+            if not e_time:
+                return f"❌ Invalid end_time format '{end_time}'."
+            updates.append("end_time = ?")
+            params.append(e_time)
+        if date:
+            if not validate_date(date):
+                return f"❌ Invalid date format '{date}'. Use YYYY-MM-DD."
+            updates.append("date = ?")
+            params.append(date)
 
-    if not updates:
-        return "⚠️ No changes provided. Pass at least one field to update."
+        if not updates:
+            return "⚠️ No changes provided. Pass at least one field to update."
 
-    # Scope the WHERE clause to both id AND user_id — prevents cross-user updates
-    params += [activity_id, user_id]
-    sql = f"UPDATE activities SET {', '.join(updates)} WHERE id = ? AND user_id = ?"
+        # Scope the WHERE clause to both id AND user_id
+        params += [activity_id, user_id]
+        sql = f"UPDATE activities SET {', '.join(updates)} WHERE id = ? AND user_id = ?"
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(sql, params)
-    updated = cursor.rowcount
-    conn.commit()
-    conn.close()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            updated = cursor.rowcount
+            conn.commit()
 
-    if updated > 0:
-        return f"✅ Updated activity #{activity_id} for user '{user_id}'"
-    return f"⚠️ Activity #{activity_id} not found for user '{user_id}'. Check ID and user."
+        if updated > 0:
+            return f"✅ Updated activity #{activity_id} for user '{user_id}'"
+        return f"⚠️ Activity #{activity_id} not found for user '{user_id}'."
+    except Exception as e:
+        return f"❌ System Error in update_activity: {str(e)}"
 
 
 @mcp.tool()
@@ -357,17 +368,19 @@ def delete_activity(
     Delete an activity by ID. Only deletes records owned by this user.
     - user_id: only deletes this user's records. Defaults to 'default_user'.
     """
-    conn = get_db()
-    cursor = conn.cursor()
-    # WHERE on both id AND user_id — prevents cross-user deletion
-    cursor.execute("DELETE FROM activities WHERE id = ? AND user_id = ?", (activity_id, user_id))
-    deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
+    try:
+        user_id = user_id or "default_user"
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM activities WHERE id = ? AND user_id = ?", (activity_id, user_id))
+            deleted = cursor.rowcount
+            conn.commit()
 
-    if deleted > 0:
-        return f"✅ Deleted activity #{activity_id} for user '{user_id}'"
-    return f"⚠️ Activity #{activity_id} not found for user '{user_id}'. Check ID and user."
+        if deleted > 0:
+            return f"✅ Deleted activity #{activity_id} for user '{user_id}'"
+        return f"⚠️ Activity #{activity_id} not found for user '{user_id}'."
+    except Exception as e:
+        return f"❌ System Error in delete_activity: {str(e)}"
 
 
 @mcp.tool()
@@ -377,22 +390,24 @@ def delete_by_keyword(
 ) -> str:
     """
     Delete activities by matching a keyword. Only deletes records owned by this user.
-    - keyword: search text to match activities.
     - user_id: only deletes this user's records. Defaults to 'default_user'.
     """
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "DELETE FROM activities WHERE description LIKE ? AND user_id = ?", 
-        (f"%{keyword}%", user_id)
-    )
-    deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
+    try:
+        user_id = user_id or "default_user"
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM activities WHERE description LIKE ? AND user_id = ?", 
+                (f"%{keyword}%", user_id)
+            )
+            deleted = cursor.rowcount
+            conn.commit()
 
-    if deleted > 0:
-        return f"✅ Deleted {deleted} activities matching '{keyword}' for user '{user_id}'"
-    return f"⚠️ No activities found matching '{keyword}' for user '{user_id}'."
+        if deleted > 0:
+            return f"✅ Deleted {deleted} activities matching '{keyword}' for user '{user_id}'"
+        return f"⚠️ No activities found matching '{keyword}' for user '{user_id}'."
+    except Exception as e:
+        return f"❌ System Error in delete_by_keyword: {str(e)}"
 
 
 @mcp.tool()
@@ -405,53 +420,54 @@ def update_by_keyword(
     user_id: str = "default_user"
 ) -> str:
     """
-    Update fields of existing activities that match a keyword. Only this user's records can be modified.
-    Provide only the fields you want to change.
-    - keyword: search text to match activities.
+    Update fields of existing activities that match a keyword.
     - user_id: only updates records owned by this user. Defaults to 'default_user'.
     """
-    updates = []
-    params = []
+    try:
+        user_id = user_id or "default_user"
+        updates = []
+        params = []
 
-    if description:
-        updates.append("description = ?")
-        params.append(description)
-        updates.append("category = ?")
-        params.append(find_category(description))
-    if start_time:
-        start_time = normalize_time(start_time)
-        if not start_time:
-            return "❌ Invalid start_time format. Examples: '14:30', '4 PM', '4:30 pm'"
-        updates.append("start_time = ?")
-        params.append(start_time)
-    if end_time:
-        end_time = normalize_time(end_time)
-        if not end_time:
-            return "❌ Invalid end_time format. Examples: '14:30', '4 PM', '4:30 pm'"
-        updates.append("end_time = ?")
-        params.append(end_time)
-    if date:
-        if not validate_date(date):
-            return "❌ Invalid date format. Use YYYY-MM-DD (e.g. 2026-04-18)"
-        updates.append("date = ?")
-        params.append(date)
+        if description:
+            updates.append("description = ?")
+            params.append(description)
+            updates.append("category = ?")
+            params.append(find_category(description))
+        if start_time:
+            s_time = normalize_time(start_time)
+            if not s_time:
+                return f"❌ Invalid start_time format '{start_time}'."
+            updates.append("start_time = ?")
+            params.append(s_time)
+        if end_time:
+            e_time = normalize_time(end_time)
+            if not e_time:
+                return f"❌ Invalid end_time format '{end_time}'."
+            updates.append("end_time = ?")
+            params.append(e_time)
+        if date:
+            if not validate_date(date):
+                return f"❌ Invalid date format '{date}'."
+            updates.append("date = ?")
+            params.append(date)
 
-    if not updates:
-        return "⚠️ No changes provided. Pass at least one field to update."
+        if not updates:
+            return "⚠️ No changes provided."
 
-    params += [f"%{keyword}%", user_id]
-    sql = f"UPDATE activities SET {', '.join(updates)} WHERE description LIKE ? AND user_id = ?"
+        params += [f"%{keyword}%", user_id]
+        sql = f"UPDATE activities SET {', '.join(updates)} WHERE description LIKE ? AND user_id = ?"
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(sql, params)
-    updated = cursor.rowcount
-    conn.commit()
-    conn.close()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            updated = cursor.rowcount
+            conn.commit()
 
-    if updated > 0:
-        return f"✅ Updated {updated} activities matching '{keyword}' for user '{user_id}'"
-    return f"⚠️ No activities found matching '{keyword}' for user '{user_id}'."
+        if updated > 0:
+            return f"✅ Updated {updated} activities matching '{keyword}' for user '{user_id}'"
+        return f"⚠️ No activities found matching '{keyword}' for user '{user_id}'."
+    except Exception as e:
+        return f"❌ System Error in update_by_keyword: {str(e)}"
 
 
 @mcp.tool()
@@ -461,34 +477,36 @@ def get_summary(
 ) -> str:
     """
     Get activity count grouped by category for a specific user.
-    - date: filter to a specific day (YYYY-MM-DD). Omit for all-time summary.
     - user_id: only summarizes this user's data. Defaults to 'default_user'.
     """
-    conn = get_db()
-    cursor = conn.cursor()
+    try:
+        user_id = user_id or "default_user"
+        with get_db() as conn:
+            cursor = conn.cursor()
 
-    sql = "SELECT category, COUNT(*) FROM activities WHERE user_id = ?"
-    params = [user_id]
+            sql = "SELECT category, COUNT(*) as count FROM activities WHERE user_id = ?"
+            params = [user_id]
 
-    if date:
-        sql += " AND date = ?"
-        params.append(date)
+            if date:
+                sql += " AND date = ?"
+                params.append(date)
 
-    sql += " GROUP BY category ORDER BY COUNT(*) DESC"
-    cursor.execute(sql, params)
-    rows = cursor.fetchall()
-    conn.close()
+            sql += " GROUP BY category ORDER BY count DESC"
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
 
-    if not rows:
-        scope = format_date_short(date) if date else "All Time"
-        return f"No activity data for user '{user_id}' [{scope}]."
+            if not rows:
+                scope = format_date_short(date) if date else "All Time"
+                return f"No activity data for user '{user_id}' [{scope}]."
 
-    scope = format_date_short(date) if date else "All Time"
-    summary = f"📊 Activity Summary for '{user_id}' ({scope}):\n"
-    for category, count in rows:
-        summary += f"  • {category}: {count} {'activity' if count == 1 else 'activities'}\n"
-    return summary.rstrip()
+            scope = format_date_short(date) if date else "All Time"
+            summary = f"📊 Activity Summary for '{user_id}' ({scope}):\n"
+            for r in rows:
+                summary += f"  • {r['category']}: {r['count']} {'activity' if r['count'] == 1 else 'activities'}\n"
+            return summary.rstrip()
+    except Exception as e:
+        return f"❌ System Error in get_summary: {str(e)}"
 
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run()
