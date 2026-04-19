@@ -10,24 +10,29 @@ from fastmcp import FastMCP
 # Initialize MCP Server
 mcp = FastMCP("Activity Tracker")
 
-# 1. SETUP PATHS — Single absolute DB path, never changes
+# 1. SETUP PATHS — Enforce absolute database path for production stability
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "tracker.db")
+DB_NAME = os.path.join(BASE_DIR, "tracker.db")
 CATEGORY_FILE = os.path.join(BASE_DIR, "categories.json")
+
+# Ensure the directory exists to prevent "unable to open database file"
+os.makedirs(BASE_DIR, exist_ok=True)
 
 def log_err(msg):
     """Log to stderr to avoid interfering with MCP stdio transport."""
     print(f"[MCP-LOG] {msg}", file=sys.stderr)
 
+# Debug: Print absolute DB path as requested
 log_err(f"🚀 MCP Activity Tracker starting...")
-log_err(f"📁 Database Path: {DB_PATH}")
+log_err(f"📁 Absolute Database Path: {DB_NAME}")
 
 # 2. DATABASE HELPERS
 @contextmanager
 def get_db():
-    """Context manager for SQLite database connections."""
+    """Context manager for SQLite database connections with multi-thread safety."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        # check_same_thread=False is essential for many MCP/FastAPI environments
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent write handling
         conn.row_factory = sqlite3.Row
         yield conn
@@ -39,6 +44,7 @@ def get_db():
 def init_db():
     """
     Ensures the table exists with user_id and UNIQUE constraint.
+    Runs at startup to ensure the system is ready for tool calls.
     """
     try:
         with get_db() as conn:
@@ -71,13 +77,9 @@ def init_db():
             conn.commit()
     except Exception as e:
         log_err(f"❌ Failed to initialize database: {e}")
-        # We don't exit here to allow the server to start, but tools will fail with error messages.
 
-# Initialize DB at startup
-try:
-    init_db()
-except Exception:
-    pass
+# IMPORTANT: Ensure database initialization runs immediately on startup
+init_db()
 
 # 3. UTILITY FUNCTIONS
 def load_categories():
@@ -92,10 +94,7 @@ def load_categories():
         return {}
 
 def find_category(activity_text: str) -> str:
-    """
-    Categorize an activity description using categories.json.
-    Supports partial matches and prioritization.
-    """
+    """Categorize an activity description using categories.json."""
     if not activity_text: return "Misc"
     text = activity_text.lower()
     
@@ -129,10 +128,9 @@ def find_category(activity_text: str) -> str:
     return "Misc"
 
 def format_time_12h(time_24h: str) -> str:
-    """Convert 13:00 → 1 PM (Platform safe formatting)"""
+    """Convert 13:00 → 1 PM"""
     try:
         dt = datetime.strptime(time_24h, "%H:%M")
-        # %I often has leading zero, we strip it for cleaner look
         return dt.strftime("%I %p").lstrip('0')
     except Exception:
         return time_24h
@@ -255,7 +253,7 @@ def search_activity(
     date: str = None,
     user_id: str = "default_user"
 ) -> str:
-    """Search activities for a specific user by keyword, category, and/or date."""
+    """Search activities for a user by keyword, category, and/or date."""
     try:
         user_id = str(user_id or "default_user")
         with get_db() as conn:
@@ -263,14 +261,11 @@ def search_activity(
             sql = "SELECT * FROM activities WHERE user_id = ?"
             params = [user_id]
             if date:
-                sql += " AND date = ?"
-                params.append(date)
+                sql += " AND date = ?"; params.append(date)
             if query:
-                sql += " AND description LIKE ?"
-                params.append(f"%{query}%")
+                sql += " AND description LIKE ?"; params.append(f"%{query}%")
             if category:
-                sql += " AND LOWER(category) = LOWER(?)"
-                params.append(category)
+                sql += " AND LOWER(category) = LOWER(?)"; params.append(category)
 
             sql += " ORDER BY date DESC, start_time ASC LIMIT 50"
             cursor.execute(sql, params)
@@ -286,7 +281,7 @@ def search_activity(
                 lines.append(f"#{r['id']} | {d} | {t} | {r['description']} | {r['category']}")
             return "\n".join(lines)
     except Exception as e:
-        return f"❌ System Error in search_activity: {str(e)}"
+        return f"❌ System Error: {str(e)}"
 
 @mcp.tool()
 def update_activity(
@@ -297,7 +292,7 @@ def update_activity(
     date: str = None,
     user_id: str = "default_user"
 ) -> str:
-    """Update an existing activity by ID. Provide only the fields to change."""
+    """Update an existing activity by ID."""
     try:
         user_id = str(user_id or "default_user")
         updates = []
@@ -328,7 +323,7 @@ def update_activity(
             conn.commit()
 
         if updated > 0: return f"✅ Updated activity #{activity_id} for '{user_id}'"
-        return f"⚠️ Activity #{activity_id} not found for '{user_id}'."
+        return f"⚠️ Activity #{activity_id} not found."
     except Exception as e:
         return f"❌ System Error: {str(e)}"
 
@@ -354,7 +349,9 @@ def get_summary(date: str = None, user_id: str = "default_user") -> str:
         user_id = str(user_id or "default_user")
         with get_db() as conn:
             cursor = conn.cursor()
-            sql = "SELECT category, COUNT(*) as count FROM activities WHERE user_id = ?"
+            sql = """SELECT category, COUNT(*) as count 
+                      FROM activities 
+                      WHERE user_id = ?"""
             params = [user_id]
             if date:
                 sql += " AND date = ?"; params.append(date)
@@ -366,38 +363,24 @@ def get_summary(date: str = None, user_id: str = "default_user") -> str:
             scope = format_date_short(date) if date else "All Time"
             res = [f"📊 Summary for '{user_id}' ({scope}):"]
             for r in rows:
-                res.append(f"  • {r['category']}: {r['count']} {'activity' if r['count'] == 1 else 'activities'}")
+                res.append(f"  • {r['category']}: {r['count']} activities")
             return "\n".join(res)
     except Exception as e:
         return f"❌ System Error: {str(e)}"
 
 if __name__ == "__main__":
-    # Robust startup logic to handle different environments
     try:
-        # Detect if we should use HTTP (cloud/pre-flight) or STDIO (local)
-        # Port 8081 is common for pre-flight requirements
         port_env = os.environ.get("PORT")
         if port_env:
-            port = int(port_env)
-            log_err(f"Starting HTTP server on port {port}...")
-            mcp.run(transport="http", host="0.0.0.0", port=port)
+            mcp.run(transport="http", host="0.0.0.0", port=int(port_env))
         elif "--port" in sys.argv:
             idx = sys.argv.index("--port")
-            port = int(sys.argv[idx+1])
-            mcp.run(transport="http", host="0.0.0.0", port=port)
+            mcp.run(transport="http", host="0.0.0.0", port=int(sys.argv[idx+1]))
         else:
-            # Default to 8081 if specified by pre-flight expectations, 
-            # OR fallback to stdio if that fails.
-            try:
-                # If we are in a terminal and no PORT is set, stdio is usually better.
-                if sys.stdin.isatty():
-                    mcp.run()
-                else:
-                    # Non-interactive might be a pre-flight check expecting a port
-                    mcp.run(transport="http", host="0.0.0.0", port=8081)
-            except Exception as e:
-                log_err(f"Failed to start preferred transport, attempting fallback: {e}")
+            if sys.stdin.isatty():
                 mcp.run()
+            else:
+                mcp.run(transport="http", host="0.0.0.0", port=8081)
     except Exception as e:
         log_err(f"CRITICAL STARTUP ERROR: {e}")
         sys.exit(1)
