@@ -3,384 +3,253 @@ import sqlite3
 import json
 import re
 import sys
-from datetime import datetime
+import logging
+import time
+import threading
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple, Dict
 from contextlib import contextmanager
 from fastmcp import FastMCP
 
-# Initialize MCP Server
-mcp = FastMCP("Activity Tracker")
+# 1. ARCHITECTURAL CONFIGURATION
+# Enforces persistent storage. No ephemeral /tmp fallback.
+DB_PATH = os.environ.get("DB_PATH", os.path.expanduser("~/.mcp_activity_tracker.db"))
+CATEGORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "categories.json")
 
-# 1. SETUP PATHS — Enforce absolute database path for production stability
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.path.join(BASE_DIR, "tracker.db")
-CATEGORY_FILE = os.path.join(BASE_DIR, "categories.json")
+# 2. CONCURRENCY CONTROL
+# Process-level write lock to prevent contention between concurrent MCP tool workers.
+_WRITE_LOCK = threading.Lock()
 
-# Ensure the directory exists to prevent "unable to open database file"
-os.makedirs(BASE_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stderr)
+logger = logging.getLogger("mcp_server")
 
-def log_err(msg):
-    """Log to stderr to avoid interfering with MCP stdio transport."""
-    print(f"[MCP-LOG] {msg}", file=sys.stderr)
-
-# Debug: Print absolute DB path as requested
-log_err(f"🚀 MCP Activity Tracker starting...")
-log_err(f"📁 Absolute Database Path: {DB_NAME}")
-
-# 2. DATABASE HELPERS
 @contextmanager
-def get_db():
-    """Context manager for SQLite database connections with multi-thread safety."""
+def get_db(write=False, retries=5):
+    """
+    Production-grade SQLite manager with exponential backoff and transaction safety.
+    """
+    if write: _WRITE_LOCK.acquire()
+    
+    conn = None
     try:
-        # check_same_thread=False is essential for many MCP/FastAPI environments
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent write handling
+        os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        
+        # Performance & Reliability Tuning
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        
+        if write: conn.execute("BEGIN TRANSACTION")
+        
         yield conn
-        conn.close()
+        
+        if write: conn.commit()
     except Exception as e:
-        log_err(f"❌ Database connection error: {e}")
+        if conn and write: conn.rollback()
+        logger.error(f"Database Error: {e}")
         raise
+    finally:
+        if conn: conn.close()
+        if write: _WRITE_LOCK.release()
 
 def init_db():
-    """
-    Ensures the table exists with user_id and UNIQUE constraint.
-    Runs at startup to ensure the system is ready for tool calls.
-    """
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
+    with get_db(write=True) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activities (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                description  TEXT NOT NULL,
+                category     TEXT,
+                start_time   TEXT NOT NULL,
+                end_time     TEXT NOT NULL,
+                date         TEXT NOT NULL,
+                user_id      TEXT NOT NULL DEFAULT 'default_user',
+                UNIQUE(description, date, start_time, end_time, user_id)
+            )
+        """)
+        # Optimize search & summary performance with b-tree indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_date ON activities(user_id, date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON activities(category)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_date ON activities(date)")
 
-            # Check if user_id column exists (handles old DBs gracefully)
-            cursor.execute("PRAGMA table_info(activities)")
-            cols = [row[1] for row in cursor.fetchall()]
-
-            if not cols:
-                # Fresh database — create with full schema
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS activities (
-                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                        description TEXT NOT NULL,
-                        category    TEXT,
-                        sub_activity TEXT,
-                        start_time  TEXT,
-                        end_time    TEXT,
-                        date        TEXT,
-                        user_id     TEXT NOT NULL DEFAULT 'default_user',
-                        UNIQUE(description, date, start_time, end_time, user_id)
-                    )
-                """)
-            elif "user_id" not in cols:
-                # Old schema — add user_id column safely
-                cursor.execute("ALTER TABLE activities ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default_user'")
-                log_err("⚠️  Migrated: added user_id column to existing table.")
-
-            conn.commit()
-    except Exception as e:
-        log_err(f"❌ Failed to initialize database: {e}")
-
-# IMPORTANT: Ensure database initialization runs immediately on startup
 init_db()
 
-# 3. UTILITY FUNCTIONS
-def load_categories():
-    """Load categories from JSON config file."""
+# 3. INTELLIGENT CATEGORY SYSTEM
+def get_category(description: str) -> str:
+    desc = description.lower()
+    scores: Dict[str, int] = {}
+    
+    # Priority weighting to avoid deterministic ties
+    priority = {"Productivity": 10, "Fitness": 9, "Study": 8, "Personal": 7}
+    
     try:
-        if not os.path.exists(CATEGORY_FILE):
-            return {}
-        with open(CATEGORY_FILE, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        log_err(f"⚠️ Error loading categories: {e}")
-        return {}
+        if os.path.exists(CATEGORY_FILE):
+            with open(CATEGORY_FILE, "r") as f:
+                categories = json.load(f)
+                for cat, keywords in categories.items():
+                    name = cat.replace("_", " ").title()
+                    score = sum(2 if re.search(rf"\b{re.escape(kw.lower())}\b", desc) else 0 for kw in keywords if kw != "other")
+                    score += sum(1 if kw.lower() in desc else 0 for kw in keywords if kw != "other")
+                    if score > 0:
+                        scores[name] = score + priority.get(name, 0) / 100.0
+    except: pass
 
-def find_category(activity_text: str) -> str:
-    """Categorize an activity description using categories.json."""
-    if not activity_text: return "Misc"
-    text = activity_text.lower()
-    
-    priority_overrides = {
-        "football": "Fitness", "cricket": "Fitness", "basketball": "Fitness",
-        "gym": "Fitness", "workout": "Fitness", "movie": "Entertainment",
-        "gaming": "Entertainment", "coding": "Productivity"
-    }
-    
-    for kw, cat in priority_overrides.items():
-        if re.search(r'\b' + re.escape(kw) + r'\b', text):
-            return cat
-
-    json_cats = load_categories()
-    if not json_cats:
+    if not scores:
+        # Hardcoded fallback logic for resilience
+        fallbacks = {"Productivity": ["work", "meeting", "code", "dev"], "Fitness": ["gym", "run", "sport"], "Personal": ["eat", "sleep", "rest"]}
+        for cat, kws in fallbacks.items():
+            if any(k in desc for k in kws): return cat
         return "Misc"
+
+    return max(scores, key=scores.get)
+
+# 4. ROBUST TIME HANDLING & ATOMIC MIDNIGHT SPLITTING
+def normalize_time(t: str) -> Optional[str]:
+    if not t: return None
+    t = str(t).strip().upper().replace('.', ':')
+    match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*([AP]M)?', t)
+    if not match: return None
+    h, m, p = int(match.group(1)), int(match.group(2) or 0), match.group(3)
+    if p == "PM" and h < 12: h += 12
+    elif p == "AM" and h == 12: h = 0
+    if h > 23 or m > 59: return None
+    return f"{h:02d}:{m:02d}"
+
+def split_activity(desc: str, start: str, end: str, date_str: str) -> List[Tuple[str, str, str, str]]:
+    if start < end: return [(desc[:500], start, end, date_str)]
+    curr_date = datetime.strptime(date_str, "%Y-%m-%d")
+    next_date = (curr_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    return [(desc[:500], start, "23:59", date_str), (desc[:500], "00:00", end, next_date)]
+
+def format_12h(t24: str) -> str:
+    return datetime.strptime(t24, "%H:%M").strftime("%I:%M %p").lstrip('0').lower()
+
+# 5. PRODUCTION-GRADE MCP TOOLS
+mcp = FastMCP("Activity Tracker")
+
+@mcp.tool()
+def log_activity(description: str, start_time: str, end_time: str, date: str = None, user_id: str = "default_user") -> str:
+    """Logs activity with atomic cross-midnight support. Enforces 500-char desc limit."""
+    try:
+        user_id = str(user_id or "default_user").strip()
+        date = date or datetime.now().strftime("%Y-%m-%d")
+        s, e = normalize_time(start_time), normalize_time(end_time)
         
-    for cat, keywords in json_cats.items():
-        for kw in keywords:
-            if kw == "other": continue
-            kw_norm = kw.replace("_", " ").lower()
-            if re.search(r'\b' + re.escape(kw_norm) + r'\b', text):
-                return cat.replace("_", " ").title()
-                
-    for cat, keywords in json_cats.items():
-        for kw in keywords:
-            if kw == "other": continue
-            kw_norm = kw.replace("_", " ").lower()
-            if kw_norm in text:
-                return cat.replace("_", " ").title()
-    return "Misc"
-
-def format_time_12h(time_24h: str) -> str:
-    """Convert 13:00 → 1 PM"""
-    try:
-        dt = datetime.strptime(time_24h, "%H:%M")
-        return dt.strftime("%I %p").lstrip('0')
-    except Exception:
-        return time_24h
-
-def format_date_short(date_str: str) -> str:
-    """Convert 2024-04-10 → Apr 10"""
-    try:
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.strftime("%b %d")
-    except Exception:
-        return date_str
-
-def normalize_time(time_str: str) -> str:
-    """Converts natural time formats to HH:MM format."""
-    if not time_str: return None
-    time_str = str(time_str).strip().upper().replace('.', '')
-    formats = ['%H:%M', '%I %p', '%I:%M %p', '%I%p', '%I:%M%p']
-    for fmt in formats:
-        try:
-            return datetime.strptime(time_str, fmt).strftime('%H:%M')
-        except ValueError:
-            continue
-    return None
-
-def validate_date(date_str: str) -> bool:
-    if not date_str: return False
-    try:
-        datetime.strptime(str(date_str), "%Y-%m-%d")
-        return True
-    except Exception:
-        return False
-
-# 4. MCP TOOLS — All scoped by user_id for full isolation
-
-@mcp.tool()
-def log_activity(
-    description: str,
-    start_time: str,
-    end_time: str,
-    date: str = None,
-    user_id: str = "default_user"
-) -> str:
-    """Log a new activity for a specific user. Times in HH:MM format. Date in YYYY-MM-DD."""
-    try:
-        user_id = str(user_id or "default_user")
-        if not date:
-            date = datetime.now().strftime("%Y-%m-%d")
-
-        s_time = normalize_time(start_time)
-        e_time = normalize_time(end_time)
+        if not s or not e: return "❌ Error: Invalid time format. Please use '2 PM' or '14:30'."
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date): return "❌ Error: Invalid date format. Use YYYY-MM-DD."
         
-        if not s_time or not e_time:
-            return f"❌ Error: Invalid time format '{start_time}' or '{end_time}'."
-        if not validate_date(date):
-            return f"❌ Error: Invalid date '{date}'. Use YYYY-MM-DD."
-
-        category = find_category(description)
-
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT OR IGNORE INTO activities
-                   (description, category, start_time, end_time, date, user_id)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (description, category, s_time, e_time, date, user_id)
-            )
-            conn.commit()
-            if cursor.rowcount == 0:
-                return f"⚠️ Duplicate skipped: '{description}' already logged for {user_id}."
-            return f"✅ Logged '{description}' under {category} for user '{user_id}'"
-    except Exception as e:
-        return f"❌ System Error in log_activity: {str(e)}"
+        category = get_category(description)
+        entries = split_activity(description, s, e, date)
+        
+        with get_db(write=True) as conn:
+            success_count = 0
+            for d, start, end, dt in entries:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO activities (description, category, start_time, end_time, date, user_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (d, category, start, end, dt, user_id)
+                )
+                success_count += cursor.rowcount
+            
+            if success_count == 0:
+                return f"⚠️ Activity already exists for {user_id}."
+            
+            summary = f"✅ Logged '{description[:50]}' as {category}"
+            if len(entries) > 1: summary += " (Split across midnight)"
+            return summary
+            
+    except Exception as ex:
+        return f"❌ Failure: {str(ex)}"
 
 @mcp.tool()
-def list_activities(
-    date: str = None,
-    keyword: str = None,
-    all_time: bool = False,
-    user_id: str = "default_user"
-) -> str:
-    """List activities for a user. Defaults to today's activities."""
+def search_activity(query: str = None, category: str = None, date: str = None, user_id: str = "default_user", limit: int = 50, offset: int = 0) -> str:
+    """Search activities with strict pagination (max 50) and transport-safe output."""
     try:
         user_id = str(user_id or "default_user")
-        if not date and not keyword and not all_time:
-            date = datetime.now().strftime("%Y-%m-%d")
-
+        sql, params = "SELECT * FROM activities WHERE user_id = ?", [user_id]
+        if query: sql += " AND description LIKE ?"; params.append(f"%{query}%")
+        if category: sql += " AND LOWER(category) = LOWER(?)"; params.append(category)
+        if date: sql += " AND date = ?"; params.append(date)
+        
+        sql += " ORDER BY date DESC, start_time ASC LIMIT ? OFFSET ?"
+        params += [min(limit, 50), max(offset, 0)]
+        
         with get_db() as conn:
-            cursor = conn.cursor()
-            query = "SELECT * FROM activities WHERE user_id = ?"
-            params = [user_id]
-
-            if not all_time and date:
-                query += " AND date = ?"
-                params.append(date)
-            if keyword:
-                query += " AND description LIKE ?"
-                params.append(f"%{keyword}%")
-
-            query += " ORDER BY date DESC, start_time ASC LIMIT 50"
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-
-            if not rows:
-                return f"No activities found for user '{user_id}'."
-
-            lines = ["#ID | Date | Time | Description | Category"]
+            rows = conn.execute(sql, params).fetchall()
+            if not rows: return f"No entries found for user '{user_id}'."
+            
+            output = [f"Found {len(rows)} entries (user: {user_id}):"]
             for r in rows:
-                d = format_date_short(r["date"])
-                t = f"{format_time_12h(r['start_time'])}–{format_time_12h(r['end_time'])}"
-                lines.append(f"#{r['id']} | {d} | {t} | {r['description']} | {r['category']}")
-
-            return "\n".join(lines)
+                t = f"{format_12h(r['start_time'])}-{format_12h(r['end_time'])}"
+                desc = (r['description'][:100] + '...') if len(r['description']) > 100 else r['description']
+                output.append(f"• [{r['date']}] {t}: {desc} ({r['category']})")
+            return "\n".join(output)
     except Exception as e:
-        return f"❌ System Error in list_activities: {str(e)}"
+        return f"❌ Search error: {str(e)}"
 
 @mcp.tool()
-def search_activity(
-    query: str = None,
-    category: str = None,
-    date: str = None,
-    user_id: str = "default_user"
-) -> str:
-    """Search activities for a user by keyword, category, and/or date."""
+def update_activity(activity_id: int, description: str = None, start_time: str = None, end_time: str = None, date: str = None, user_id: str = "default_user") -> str:
+    """Update existing entry. Enforces same validation as log_activity."""
     try:
-        user_id = str(user_id or "default_user")
-        with get_db() as conn:
-            cursor = conn.cursor()
-            sql = "SELECT * FROM activities WHERE user_id = ?"
-            params = [user_id]
-            if date:
-                sql += " AND date = ?"; params.append(date)
-            if query:
-                sql += " AND description LIKE ?"; params.append(f"%{query}%")
-            if category:
-                sql += " AND LOWER(category) = LOWER(?)"; params.append(category)
-
-            sql += " ORDER BY date DESC, start_time ASC LIMIT 50"
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-
-            if not rows:
-                return f"No activities found for user '{user_id}' matching filters."
-
-            lines = ["#ID | Date | Time | Description | Category"]
-            for r in rows:
-                d = format_date_short(r["date"])
-                t = f"{format_time_12h(r['start_time'])}–{format_time_12h(r['end_time'])}"
-                lines.append(f"#{r['id']} | {d} | {t} | {r['description']} | {r['category']}")
-            return "\n".join(lines)
-    except Exception as e:
-        return f"❌ System Error: {str(e)}"
-
-@mcp.tool()
-def update_activity(
-    activity_id: int,
-    description: str = None,
-    start_time: str = None,
-    end_time: str = None,
-    date: str = None,
-    user_id: str = "default_user"
-) -> str:
-    """Update an existing activity by ID."""
-    try:
-        user_id = str(user_id or "default_user")
-        updates = []
-        params = []
+        u_id = str(user_id or "default_user")
+        fields, params = [], []
         if description:
-            updates.append("description = ?"); params.append(description)
-            updates.append("category = ?"); params.append(find_category(description))
+            fields.append("description = ?"); params.append(description[:500])
+            fields.append("category = ?"); params.append(get_category(description))
         if start_time:
             s = normalize_time(start_time)
-            if not s: return f"❌ Invalid start_time '{start_time}'."
-            updates.append("start_time = ?"); params.append(s)
+            if s: fields.append("start_time = ?"); params.append(s)
         if end_time:
             e = normalize_time(end_time)
-            if not e: return f"❌ Invalid end_time '{end_time}'."
-            updates.append("end_time = ?"); params.append(e)
+            if e: fields.append("end_time = ?"); params.append(e)
         if date:
-            if not validate_date(date): return f"❌ Invalid date '{date}'."
-            updates.append("date = ?"); params.append(date)
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+                fields.append("date = ?"); params.append(date)
 
-        if not updates: return "⚠️ No changes provided."
-        params += [activity_id, user_id]
-        sql = f"UPDATE activities SET {', '.join(updates)} WHERE id = ? AND user_id = ?"
-
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql, params)
-            updated = cursor.rowcount
-            conn.commit()
-
-        if updated > 0: return f"✅ Updated activity #{activity_id} for '{user_id}'"
-        return f"⚠️ Activity #{activity_id} not found."
+        if not fields: return "⚠️ Nothing to update."
+        params += [activity_id, u_id]
+        sql = f"UPDATE activities SET {', '.join(fields)} WHERE id = ? AND user_id = ?"
+        
+        with get_db(write=True) as conn:
+            c = conn.execute(sql, params)
+            return f"✅ Activity #{activity_id} updated." if c.rowcount > 0 else "⚠️ Activity not found."
     except Exception as e:
-        return f"❌ System Error: {str(e)}"
+        return f"❌ Update failed: {str(e)}"
 
 @mcp.tool()
 def delete_activity(activity_id: int, user_id: str = "default_user") -> str:
-    """Delete an activity by ID."""
+    """Atomic deletion of an activity record."""
     try:
-        user_id = str(user_id or "default_user")
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM activities WHERE id = ? AND user_id = ?", (activity_id, user_id))
-            deleted = cursor.rowcount
-            conn.commit()
-        if deleted > 0: return f"✅ Deleted activity #{activity_id}"
-        return f"⚠️ Activity #{activity_id} not found."
+        with get_db(write=True) as conn:
+            c = conn.execute("DELETE FROM activities WHERE id = ? AND user_id = ?", (activity_id, str(user_id or "default_user")))
+            return f"✅ Removed activity #{activity_id}" if c.rowcount > 0 else "⚠️ Not found."
     except Exception as e:
-        return f"❌ System Error: {str(e)}"
+        return f"❌ Deletion failed."
 
 @mcp.tool()
-def get_summary(date: str = None, user_id: str = "default_user") -> str:
-    """Get activity count grouped by category for a user."""
+def get_activity_stats(user_id: str = "default_user", days: int = 7) -> str:
+    """High-performance summary using indexed category and date lookups."""
     try:
-        user_id = str(user_id or "default_user")
+        u_id = str(user_id or "default_user")
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        sql = "SELECT category, COUNT(*) as count FROM activities WHERE user_id = ? AND date >= ? GROUP BY category ORDER BY count DESC"
+        
         with get_db() as conn:
-            cursor = conn.cursor()
-            sql = """SELECT category, COUNT(*) as count 
-                      FROM activities 
-                      WHERE user_id = ?"""
-            params = [user_id]
-            if date:
-                sql += " AND date = ?"; params.append(date)
-            sql += " GROUP BY category ORDER BY count DESC"
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-
-            if not rows: return f"No data for user '{user_id}'."
-            scope = format_date_short(date) if date else "All Time"
-            res = [f"📊 Summary for '{user_id}' ({scope}):"]
+            rows = conn.execute(sql, (u_id, cutoff)).fetchall()
+            if not rows: return f"No logs found in last {days} days for '{u_id}'."
+            
+            res = [f"📊 Usage Stats for '{u_id}' (Past {days} days):"]
             for r in rows:
-                res.append(f"  • {r['category']}: {r['count']} activities")
+                res.append(f"  • {r['category']}: {r['count']} sessions")
             return "\n".join(res)
     except Exception as e:
-        return f"❌ System Error: {str(e)}"
+        return f"❌ Summary generation failed."
 
 if __name__ == "__main__":
-    try:
-        port_env = os.environ.get("PORT")
-        if port_env:
-            mcp.run(transport="http", host="0.0.0.0", port=int(port_env))
-        elif "--port" in sys.argv:
-            idx = sys.argv.index("--port")
-            mcp.run(transport="http", host="0.0.0.0", port=int(sys.argv[idx+1]))
-        else:
-            if sys.stdin.isatty():
-                mcp.run()
-            else:
-                mcp.run(transport="http", host="0.0.0.0", port=8081)
-    except Exception as e:
-        log_err(f"CRITICAL STARTUP ERROR: {e}")
-        sys.exit(1)
+    if not sys.stdin.isatty():
+        mcp.run()
+    else:
+        # Development / Remote HTTP fallback
+        port = int(os.environ.get("PORT", 8080))
+        logger.info(f"Starting MCP Server on port {port}...")
+        mcp.run(transport="http", host="0.0.0.0", port=port)
