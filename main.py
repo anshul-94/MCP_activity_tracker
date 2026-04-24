@@ -132,6 +132,32 @@ def activity_summary(user_id="default_user", days=7):
 
     return "\n".join([f"{r['category']}: {r['c']}" for r in rows]) or "No data"
 
+
+@mcp.tool()
+def delete_activity(description:str=None, date:str=None, user_id="default_user"):
+    if not description and not date:
+        return "❌ Provide description or date to delete"
+
+    sql = "DELETE FROM activities WHERE user_id=?"
+    params = [user_id]
+
+    if description:
+        sql += " AND description LIKE ?"
+        params.append(f"%{description}%")
+
+    if date:
+        d = norm_date(date)
+        if not d:
+            return "❌ Invalid date"
+        sql += " AND date=?"
+        params.append(d)
+
+    with db(True) as c:
+        cur = c.execute(sql, params)
+        count = cur.rowcount
+
+    return f"🗑️ Deleted {count} activities" if count else "No matching activity found"
+
 # ---------------- RUN ----------------
 if __name__ == "__main__":
     mcp.run() if not sys.stdin.isatty() else mcp.run(transport="http", host="0.0.0.0", port=int(os.getenv("PORT",8080)))
